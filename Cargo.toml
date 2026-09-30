@@ -2,6 +2,8 @@
 name = "tree-sha256"
 version = "0.1.0"
 edition = "2024"
+description = "SHA-256 content hash of a Git tree, and SSH-signed tags that carry it"
+repository = "https://github.com/schacon/tree-sha256"
 
 [dependencies]
 anyhow = "1.0.104"
