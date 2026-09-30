@@ -1,0 +1,11 @@
+[package]
+name = "tree-sha256"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+gix = { version = "0.88.0", default-features = false, features = ["max-performance-safe", "parallel", "sha1", "revision"] }
+rayon = "1.12.0"
+sha2 = "0.11.0"
+tempfile = "3.27.0"
