@@ -3,6 +3,8 @@
 //! Checks that the tag's SSH signature is valid (via `git verify-tag`, so
 //! `gpg.ssh.allowedSignersFile` decides which keys are trusted) and that its
 //! `tree-sha256` header matches a fresh hash of the tagged tree's contents.
+//! Submodules named in `tree-sha256-excluded` headers are left out exactly as
+//! they were when signing, and reported as not verifiable.
 //! The signature check runs in a child process while the tree is hashed.
 //!
 //! Usage: tree-sha256-verify [--repo <path>] [--no-signature] <tag>
@@ -11,7 +13,7 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use tree_sha256::{HEADER, hex, parse_args, tree_sha256};
+use tree_sha256::{EXCLUDED_HEADER, HEADER, Options, hex, parse_args, tree_sha256};
 
 const USAGE: &str = "tree-sha256-verify [--repo <path>] [--no-signature] <tag>";
 
@@ -54,12 +56,16 @@ fn main() -> Result<()> {
         })
         .transpose()?;
 
-    let (target, claimed) = parse_headers(&tag_obj.data)?;
+    let headers = parse_headers(&tag_obj.data)?;
+    let opts = Options {
+        exact: headers.excluded.clone(),
+        ..Options::default()
+    };
 
     let t = Instant::now();
-    let (digest, files) = tree_sha256(&repo, target)?;
+    let hashed = tree_sha256(&repo, headers.object, &opts)?;
     let hash_time = t.elapsed();
-    let actual = hex(&digest);
+    let actual = hex(&hashed.digest);
 
     let signature_ok = match verifier {
         Some(child) => {
@@ -70,13 +76,39 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let tree_ok = actual == claimed;
+    // Every excluded path in the tag must really be a submodule of this tree.
+    let found: Vec<&str> = hashed.excluded.iter().map(|(p, _)| p.as_str()).collect();
+    let bogus: Vec<&String> = headers
+        .excluded
+        .iter()
+        .filter(|p| !found.contains(&p.as_str()))
+        .collect();
+
+    let tree_ok = actual == headers.claimed && bogus.is_empty();
     eprintln!(
-        "{files} files hashed in {hash_time:.2?}, total {:.2?}",
+        "{} files in {} submodules hashed in {hash_time:.2?}, total {:.2?}",
+        hashed.files,
+        hashed.submodules,
         total.elapsed()
     );
-    if !tree_ok {
-        eprintln!("MISMATCH: tag claims {HEADER} {claimed}\n          tree hashes to {actual}");
+    if actual != headers.claimed {
+        eprintln!(
+            "MISMATCH: tag claims {HEADER} {}\n          tree hashes to {actual}",
+            headers.claimed
+        );
+    }
+    for path in &bogus {
+        eprintln!("MISMATCH: {EXCLUDED_HEADER} {path} is not a submodule in this tree");
+    }
+    if !hashed.excluded.is_empty() {
+        eprintln!(
+            "NOT VERIFIABLE: {} submodules were excluded when signing; only their \
+             pinned commits are covered, not their contents:",
+            hashed.excluded.len()
+        );
+        for (path, commit) in &hashed.excluded {
+            eprintln!("  {path} ({commit})");
+        }
     }
     match signature_ok {
         Some(false) => eprintln!("BAD SIGNATURE on {tag_id}"),
@@ -84,19 +116,30 @@ fn main() -> Result<()> {
         Some(true) => {}
     }
     if tree_ok && signature_ok != Some(false) {
-        println!("OK {tag} {target} {HEADER} {actual}");
+        let partial = if hashed.excluded.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} submodules not verifiable)", hashed.excluded.len())
+        };
+        println!("OK {tag} {} {HEADER} {actual}{partial}", headers.object);
         Ok(())
     } else {
         std::process::exit(1);
     }
 }
 
-/// Return the tagged object and the `tree-sha256` value from the tag's header
-/// block. The header block ends at the first blank line, before the message
-/// and signature, so a value found here is covered by the signature.
-fn parse_headers(data: &[u8]) -> Result<(gix::ObjectId, String)> {
+struct Headers {
+    object: gix::ObjectId,
+    claimed: String,
+    excluded: Vec<String>,
+}
+
+/// Read the tag's header block. It ends at the first blank line, before the
+/// message and signature, so everything found here is covered by the signature.
+fn parse_headers(data: &[u8]) -> Result<Headers> {
     let mut object = None;
     let mut claimed = None;
+    let mut excluded = Vec::new();
     for line in data.split(|&b| b == b'\n') {
         if line.is_empty() {
             break;
@@ -112,11 +155,13 @@ fn parse_headers(data: &[u8]) -> Result<(gix::ObjectId, String)> {
             }
             HEADER if claimed.is_some() => bail!("tag has more than one {HEADER} header"),
             HEADER => claimed = Some(value.to_owned()),
+            EXCLUDED_HEADER => excluded.push(value.to_owned()),
             _ => {}
         }
     }
-    Ok((
-        object.context("tag has no object header")?,
-        claimed.with_context(|| format!("tag has no {HEADER} header"))?,
-    ))
+    Ok(Headers {
+        object: object.context("tag has no object header")?,
+        claimed: claimed.with_context(|| format!("tag has no {HEADER} header"))?,
+        excluded,
+    })
 }

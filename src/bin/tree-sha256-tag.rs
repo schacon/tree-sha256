@@ -6,6 +6,7 @@
 //!     type commit
 //!     tag <name>
 //!     tagger <ident>
+//!     tree-sha256-excluded <path>     (one per excluded submodule, if any)
 //!     tree-sha256 <hex>
 //!
 //!     <message>
@@ -15,7 +16,9 @@
 //! same way `git tag -s` does with `gpg.format=ssh`, so `git verify-tag`
 //! accepts the result.
 //!
-//! Usage: tree-sha256-tag [--repo <path>] [-m <msg>] [-f] <tagname> [<rev>]
+//! Usage: tree-sha256-tag [--repo <path>] [-m <msg>] [-f]
+//!                        [--exclude-submodule <pattern>]... [--exclude-from <file>]
+//!                        <tagname> [<rev>]
 
 use std::io::Write as _;
 use std::process::Command;
@@ -24,18 +27,20 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use gix::objs::Write as _;
 use gix::refs::transaction::PreviousValue;
-use tree_sha256::{HEADER, hex, parse_args, tree_sha256};
+use tree_sha256::{EXCLUDED_HEADER, HEADER, Options, hex, parse_args, tree_sha256};
 
-const USAGE: &str = "tree-sha256-tag [--repo <path>] [-m <msg>] [-f] <tagname> [<rev>]";
+const USAGE: &str = "tree-sha256-tag [--repo <path>] [-m <msg>] [-f] \
+                     [--exclude-submodule <pattern>]... [--exclude-from <file>] <tagname> [<rev>]";
 
 fn main() -> Result<()> {
     let mut message = None;
     let mut force = false;
+    let mut opts = Options::default();
     let (repo_path, positional) = parse_args(USAGE, |flag, args| {
         match flag {
             "-m" | "--message" => message = Some(args.next().context("-m needs a message")?),
             "-f" | "--force" => force = true,
-            _ => return Ok(false),
+            _ => return opts.flag(flag, args),
         }
         Ok(true)
     })?;
@@ -55,8 +60,11 @@ fn main() -> Result<()> {
         .peel_to_commit()?;
 
     let t = Instant::now();
-    let (digest, files) = tree_sha256(&repo, commit.id)?;
+    let hashed = tree_sha256(&repo, commit.id, &opts)?;
     let hash_time = t.elapsed();
+    if let Some((path, _)) = hashed.excluded.iter().find(|(p, _)| p.contains('\n')) {
+        bail!("can't record excluded submodule path {path:?} in a tag header");
+    }
 
     let tagger = repo
         .committer()
@@ -68,7 +76,10 @@ fn main() -> Result<()> {
     write!(payload, "tagger ")?;
     tagger.write_to(&mut payload)?;
     writeln!(payload)?;
-    writeln!(payload, "{HEADER} {}", hex(&digest))?;
+    for (path, _) in &hashed.excluded {
+        writeln!(payload, "{EXCLUDED_HEADER} {path}")?;
+    }
+    writeln!(payload, "{HEADER} {}", hex(&hashed.digest))?;
     writeln!(payload)?;
     let message = message.unwrap_or_else(|| name.to_owned());
     payload.extend_from_slice(message.trim_end().as_bytes());
@@ -101,12 +112,23 @@ fn main() -> Result<()> {
     println!("{tag_id}");
     eprintln!(
         "tagged {} as {name} ({HEADER} {})\n\
-         {files} files hashed in {hash_time:.2?}, signed in {sign_time:.2?}, \
+         {} files in {} submodules hashed in {hash_time:.2?}, signed in {sign_time:.2?}, \
          written in {write_time:.2?}, total {:.2?}",
         commit.id,
-        hex(&digest),
+        hex(&hashed.digest),
+        hashed.files,
+        hashed.submodules,
         total.elapsed(),
     );
+    if !hashed.excluded.is_empty() {
+        eprintln!(
+            "{} submodules excluded and recorded as unverifiable in {EXCLUDED_HEADER} headers",
+            hashed.excluded.len()
+        );
+    }
+    if !hashed.cycles.is_empty() {
+        eprintln!("{} submodules recorded as cycles", hashed.cycles.len());
+    }
     Ok(())
 }
 
